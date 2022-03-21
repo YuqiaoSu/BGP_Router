@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+
+#Yuqiao Su 03/10/2022
+
+import argparse, socket, time, json, select, struct, sys, math
+import copy
+from ast import dump
+from cgitb import reset
+from re import T, X
+import struct
+
+class Router:
+
+    relations = {}
+    sockets = {}
+    ports = {}
+    bufferTable = [] # a list of messages stored in buffer in case of withdraw
+    forwardTable = [] # The table that aggregated
+
+
+    def __init__(self, asn, connections):
+        print("Router at AS %s starting up" % asn)
+        self.asn = asn
+        for relationship in connections:
+            port, neighbor, relation = relationship.split("-")
+            self.sockets[neighbor] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sockets[neighbor].bind(('localhost', 0))
+            self.ports[neighbor] = int(port)
+            self.relations[neighbor] = relation
+            self.send(neighbor, json.dumps({ "type": "handshake", "src": self.our_addr(neighbor), "dst": neighbor, "msg": {}}))
+
+    #the address of this router is one less than its neightbor
+    def our_addr(self, dst):
+        quads = list(int(qdn) for qdn in dst.split('.'))
+        quads[3] = 1
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+
+    #send to a network using message
+    def send(self, network, message):
+        self.sockets[network].sendto(message.encode('utf-8'), ('localhost', self.ports[network]))
+    
+    # function to check if x is power of 2
+    def isPowerOfTwo(self,x ):
+        return x and (not(x & (x - 1)))
+
+    #convert decimal to binary
+    def decTobin(self, num):
+        str = bin(num)
+        str = str[2:len(str)]
+        for index in range(8 - len(str)):
+            str = "0" + str
+        return str
+
+    #is these two entry on my forward table aggregateble
+    def aggregatable(self,curEntry,prevEntry):
+        curcidr= self.ipToCIDR(curEntry['msg']['netmask'])
+        precidr= self.ipToCIDR(prevEntry['msg']['netmask'])
+        if(abs(curcidr - precidr) != 0):
+            return False #not aggregatable if cidr is different
+        if(curEntry['src'] != prevEntry['src']):
+            return False #not aggregatable if source is different
+        shared_items = {k: curEntry['msg'][k] for k in curEntry['msg'] if k in prevEntry['msg'] and curEntry['msg'][k] != prevEntry['msg'][k]}
+        if(len(shared_items) == 1):
+            curNetwork = self.ipToInt(curEntry['msg']['network'])
+            nexNetwork = self.ipToInt(prevEntry['msg']['network'])
+            count = 0
+            difference_flag = 0
+            last_flag = 0
+            for i in range(len(curNetwork)):
+                if (curcidr <= 8 + count):
+                    range_check = curcidr - count - 1
+                    last_flag = 1
+                else:
+                    range_check = 8
+                    count += 8
+                current_part = self.decTobin(curNetwork[i])
+                nex_part = self.decTobin(nexNetwork[i])
+                for str_index in range(range_check):
+                    if (current_part[str_index] != nex_part[str_index]):
+                        difference_flag = 1
+                if (last_flag == 1):
+                    if (difference_flag == 1):
+                        return False
+                    else:
+                        return True
+        return False
+
+    # decrease the netmask by 1 from CIDR and return the dotted 
+    def decr(self,cidr):
+        cidr = cidr - 1
+        new_mask = (0xffffffff >> (32 - cidr)) << (32 - cidr)
+        return (str((0xff000000 & new_mask) >> 24) + '.' +
+                str((0x00ff0000 & new_mask) >> 16) + '.' +
+                str((0x0000ff00 & new_mask) >> 8) + '.' +
+                str((0x000000ff & new_mask)))
+
+    #if the cur is already contained 
+    def is_contained(self,cur,pre):
+        if(cur['src'] != pre['src']):
+            return False
+        shared_items = {k: cur['msg'][k] for k in cur['msg'] if k in pre['msg'] and cur['msg'][k] != pre['msg'][k]}
+        curcidr= self.ipToCIDR(cur['msg']['netmask'])
+        precidr= self.ipToCIDR(pre['msg']['netmask'])
+        return len(shared_items) <= 2 and curcidr < precidr
+
+    def aggregate(self, curEntry,prevEntry):
+        replaceEntry =curEntry if self.lowerIp(curEntry['msg']['network'],prevEntry['msg']['network']) else prevEntry
+        replaceCIDR= self.ipToCIDR(replaceEntry['msg']['netmask'])
+        replaceEntry['msg']['netmask'] = self.decr(replaceCIDR)
+        return replaceEntry
+    
+    def loop_for_previous(self,entry):
+        flag = False
+        for i in self.forwardTable:
+            if(self.aggregatable(entry,i)):
+                flag=True
+                entry = self.aggregate(entry,i)
+                break;
+        if(flag):
+            self.loop_for_previous(entry)
+        return flag
+
+    #Use bufferTable to aggregate, dump if withdraw is called
+    def update_forwardTable(self):
+        self.forwardTable = []
+        for i in range(len(self.bufferTable)):
+            flag = False
+            curEntry = copy.deepcopy(self.bufferTable[i])
+            for j in range(len(self.forwardTable)):
+                prevEntry = self.forwardTable[j]
+                
+                if(self.aggregatable(curEntry,prevEntry)):
+                    flag = True
+                    replaceEntry = self.aggregate(curEntry,prevEntry)
+                    self.forwardTable.remove(prevEntry)
+                    loop_flag = self.loop_for_previous(replaceEntry)
+                    self.forwardTable.append(replaceEntry)
+                    if(loop_flag):
+                        self.forwardTable.remove(replaceEntry)
+                    break
+            if(not flag):
+                self.forwardTable.append(curEntry)
+
+
+    # When update message is received.
+    def update_message(self, message):
+        msg = copy.deepcopy(message)
+        self.bufferTable.append(message)
+        self.announce_update(msg)
+        self.update_forwardTable()
+
+    #return the relation of this message
+    def msg_relation(self,message):
+        return self.relations[message['src']];
+
+    #annouce the updated to other
+    def announce_update(self,message):
+        temp = self.asn
+        msg = {"netmask": message['msg']['netmask'],"ASPath": message['msg']['ASPath'],"network": message['msg']['network']};
+        msg['ASPath'].insert(0,temp) #insert our AS Number
+        if(self.msg_relation(message) == "cust"):
+            for network in self.ports:
+                if(network != message['src']):
+                    self.send(network,json.dumps({ "msg": msg, "src": self.our_addr(network), "dst":network,"type": "update"})) #send to all except the source
+        else:
+            for network in self.ports:
+                if(network != message['src']):
+                    if(self.relations[network] == "cust"):
+                        self.send(network,json.dumps({ "msg": msg, "src": self.our_addr(network), "dst":network,"type": "update"})) #send to only customers
+    
+    #annouce the withdrawed to other
+    def announce_withdraw(self,message):
+        temp = self.asn
+        msg = message['msg']
+        if(self.msg_relation(message) == "cust"):
+            for network in self.ports:
+                if(network != message['src']):
+                    self.send(network,json.dumps({ "msg": msg, "src": self.our_addr(network), "dst":network,"type": "withdraw"})) #send to all except the source
+        else:
+            for network in self.ports:
+                if(network != message['src']):
+                    if(self.relations[network] == "cust"):
+                        self.send(network,json.dumps({ "msg": msg, "src": self.our_addr(network), "dst":network,"type": "withdraw"})) #send to only customers
+    
+
+    #delete an recorded entry in the buffered table.
+    def withdraw_entry(self, message):
+        pop_buffer = []
+        for i in range(len(message['msg'])):
+            for j in range(len(self.bufferTable)):
+                if(self.bufferTable[j]['src'] == message['src']
+                    and self.bufferTable[j]['msg']['network'] == message['msg'][i]['network'] 
+                    and self.bufferTable[j]['msg']['netmask'] == message['msg'][i]['netmask']):
+                    pop_buffer.append(self.bufferTable[j])
+        self.announce_withdraw(message)
+        if(len(pop_buffer)):
+            [self.bufferTable.remove(k) for k in pop_buffer]
+        self.update_forwardTable()
+
+    # when message is dump, dump the forwardTable(aggregated) to that port as dst
+    def dump_fowardTable(self, message):
+        source = message['dst']
+        destination= message['src']
+        result = []
+        for msg in self.forwardTable:
+            dump_dict = {'origin': msg['msg']['origin'], 'localpref': msg['msg']['localpref'], 
+            'network': msg['msg']['network'], 'ASPath': msg['msg']['ASPath'], 'netmask': msg['msg']['netmask'],
+             'peer':  msg['src'], 'selfOrigin':  msg['msg']['selfOrigin']}
+            result.append(dump_dict) #The sequence required by dump message. Might not be changed here but when creating the table.
+        self.send(destination, json.dumps({"type": "table","src": source, "dst": destination, "msg": result}))
+
+
+    #break down the ip that has dot inside into a list of int.
+    def ipToInt(self,ip):
+        return list(int(x) for x in ip.split('.'))
+    
+    #only works when all consecutive 1's
+    def ipToCIDR(self,ip):
+        return sum([str(bin(int(x))).count("1") for x in ip.split(".")])
+
+    #if the curOrigin is more preferred than next's
+    def betterOrigin(self,curOrigin, nexOrigin):
+        if(curOrigin == nexOrigin):
+            return False
+        elif(curOrigin == "IGP"):
+            return True
+        elif(curOrigin == "EGP" and nexOrigin == "UNK"):
+            return True
+        else:
+            return False
+
+    #if the current source is lower than next source, comparing from first 8 bit to last
+    def lowerIp(self, curSrc, nexSrc):
+        curSrc = self.ipToInt(curSrc)
+        nexSrc = self.ipToInt(nexSrc)
+        for i in range(len(curSrc)):
+            if(curSrc[i] < nexSrc[i]):
+                return True
+        return False
+
+    #which one is more prefered on the routing table
+    def morePrefered(self,curEntry,nextEntry):
+        cur_CIDR = self.ipToCIDR(curEntry['msg']['netmask'])
+        nex_CIDR = self.ipToCIDR(nextEntry['msg']['netmask'])
+        if(cur_CIDR > nex_CIDR):
+            return curEntry #longest prefix
+        elif(cur_CIDR == nex_CIDR):
+            if(curEntry['msg']['localpref'] > nextEntry['msg']['localpref']):
+                return curEntry #highest localpref
+            if(curEntry['msg']['localpref'] < nextEntry['msg']['localpref']):
+                return nextEntry #highest localpref
+            elif(curEntry['msg']['localpref'] == nextEntry['msg']['localpref']):
+                if(curEntry['msg']['selfOrigin'] != nextEntry['msg']['selfOrigin'] and curEntry['msg']['selfOrigin']):
+                    return curEntry #current self Origin is true and next is not
+                elif(curEntry['msg']['selfOrigin'] != nextEntry['msg']['selfOrigin'] and nextEntry['msg']['selfOrigin']):
+                     return nextEntry
+                elif(curEntry['msg']['selfOrigin'] == nextEntry['msg']['selfOrigin']):
+                    if(len(curEntry['msg']['ASPath']) < len(nextEntry['msg']['ASPath'])):
+                        return curEntry #shortest ASPath
+                    elif(len(curEntry['msg']['ASPath']) > len(nextEntry['msg']['ASPath'])):
+                        return nextEntry
+                    elif(len(curEntry['msg']['ASPath']) == len(nextEntry['msg']['ASPath'])):
+                        if(curEntry['msg']['origin'] != nextEntry['msg']['origin']):
+                            if(self.betterOrigin(curEntry['msg']['origin'],nextEntry['msg']['origin'])):
+                                return curEntry #best origin
+                            else:
+                                return nextEntry
+                        else:
+                            if(self.lowerIp(curEntry['src'],nextEntry['src'])):
+                                 return curEntry #lowest neighbor
+                            else :
+                                return nextEntry
+        else:
+            return nextEntry #Above are all cases that curEntry can win.
+    
+    #does this message fall in this port, if it is, return true.
+    def fall_in(self,ip,message):
+        addressPrefix = self.ipToInt(ip['network'])
+        subnetmask = self.ipToInt(ip['netmask'])
+        msg_ip = self.ipToInt(message['dst'])
+
+        bitandRes = []
+        for i in range(len(msg_ip)):
+            bitandRes.append(msg_ip[i] & subnetmask[i])
+        
+        flag = True
+        for i in range(len(addressPrefix)):
+            flag = flag & (bitandRes[i] == addressPrefix[i])
+        return flag
+
+
+    #need to handle illegal data from peer and provider
+    def send_data(self,message,src):
+        fall_flag = False
+        created = False
+        for i in range(len(self.forwardTable)):
+            if(self.fall_in(self.forwardTable[i]['msg'], message)):
+                fall_flag = True
+                if(created):
+                    most_precise = self.morePrefered(most_precise,self.forwardTable[i]) #choose which one is more prefered
+                else :
+                    created = True
+                    most_precise = self.forwardTable[i] #the first port that falls in
+        
+        if(fall_flag and created):
+            if(self.relations[src] == "cust" or self.relations[most_precise['src']] == "cust"):
+                self.send(most_precise['src'], 
+                    json.dumps({"type": "data","src": message['src'], "dst": message['dst'], "msg": message['msg']})) #send to the most prefered neighbor
+            else :
+                self.send (src,json.dumps({"type": "no route","src": self.our_addr(message['src']), "dst": message['src'], "msg": {}}))
+        else:
+            return #do nothing
+    
+        
+
+
+
+    def run(self):
+        while True:
+            socks = select.select(self.sockets.values(), [], [], 0.1)[0]
+            for conn in socks:
+                k, addr = conn.recvfrom(65535)
+                srcif = None
+                for sock in self.sockets:
+                    if self.sockets[sock] == conn:
+                        srcif = sock
+                        break
+                msg = k.decode('utf-8')
+                message = json.loads(msg)
+                if(message['type'] == "update"):
+                    self.update_message(message)
+                
+                if(message['type'] == "dump"):
+                    self.dump_fowardTable(message)
+                
+                if(message['type'] == "data"):
+                    self.send_data(message,srcif)
+                
+                if(message['type'] == "withdraw"):
+                    self.withdraw_entry(message)
+                print("_______________________",flush=True)
+                print(self.relations,flush= True)
+                print("Received message '%s' from %s" % (msg, srcif),flush= True)
+        return
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='route packets')
+    parser.add_argument('asn', type=int, help="AS number of this router")
+    parser.add_argument('connections', metavar='connections', type=str, nargs='+', help="connections")
+    args = parser.parse_args()
+    router = Router(args.asn, args.connections)
+    router.run()
